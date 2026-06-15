@@ -1,0 +1,1185 @@
+"""
+╔══════════════════════════════════════════════════════════════════════════════╗
+║  DISASTER SEVERITY – BASE BANGLABERT + VISION                                ║
+║  2-Model Late Fusion: Base BanglaBERT + EfficientNet-B4-NS                 ║
+║  Target: 0.81+ Weighted F1  |  Runtime Budget: < 2 hours on T4 GPU        ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+Architecture:
+  ┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐
+  │  XLM-RoBERTa-Large  │  │  BanglaBERT-Large   │  │  EfficientNet-B4-NS │
+  │  (355M, 24 layers)  │  │  (ELECTRA-L, 24 lyr)│  │  (timm, pretrained) │
+  │  5-fold, 6 epochs   │  │  5-fold, 5 epochs   │  │  5-fold, 10 epochs  │
+  │  AWP + LLRD + EMA   │  │  AWP + LLRD + EMA   │  │  Mixup + TTA + Focal│
+  └────────┬────────────┘  └────────┬────────────┘  └────────┬────────────┘
+           │                        │                         │
+           └──────────┬─────────────┴──────────┬──────────────┘
+                      │  CV-Weighted Ensemble   │
+                      ▼                         │
+              Bayesian Prior Adjustment         │
+                      │                         │
+              Pseudo-Labeling (2 rounds)        │
+                      │                         │
+              Hard Rule: Non Disaster → Minimal │
+                      ▼
+              Final Submission
+"""
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CELL 1: Imports & Seed
+# ═══════════════════════════════════════════════════════════════════════════════
+import os, re, random, warnings, zipfile, gc, shutil, time
+from collections import defaultdict
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset as TorchDataset, DataLoader
+
+from PIL import Image
+from scipy.special import softmax as scipy_softmax
+
+# Vision
+import timm
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+
+# NLP
+from transformers import (
+    AutoTokenizer, AutoModel, AutoModelForSequenceClassification,
+    Trainer, TrainingArguments, get_cosine_schedule_with_warmup, set_seed,
+)
+from datasets import Dataset as HFDataset
+
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+from sklearn.utils.class_weight import compute_class_weight
+from tqdm.auto import tqdm
+
+warnings.filterwarnings("ignore")
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+START_TIME = time.time()
+
+def elapsed():
+    return f"{(time.time() - START_TIME) / 60:.1f} min"
+
+def seed_everything(seed=42):
+    random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"  # Prevent OOM fragmentation
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    set_seed(seed)
+
+seed_everything(42)
+print(f"Device: {DEVICE}")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CELL 2: Configuration
+# ═══════════════════════════════════════════════════════════════════════════════
+BASE_PATH = "/kaggle/input/competitions/datathon-iiuc-cse-fest-2026/DisasterSeverity/"
+WORK_DIR  = "/kaggle/working/"
+
+IMG_DIRS = {
+    "train":      os.path.join(BASE_PATH, "Train"),
+    "validation": os.path.join(BASE_PATH, "Validation"),
+    "test":       os.path.join(BASE_PATH, "Test"),
+}
+
+label_map         = {"Minimal": 0, "Mild": 1, "Moderate": 2, "Severe": 3, "Catastrophic": 4}
+reverse_label_map = {v: k for k, v in label_map.items()}
+NUM_CLASSES       = 5
+
+# ── Shared Hyperparameters ─────────────────────────────────────────────────
+SHARED = dict(
+    n_folds        = 5,
+    seed           = 42,
+    weight_decay   = 0.01,
+    warmup_ratio   = 0.10,
+    bayesian_alpha = 0.15,   # Conservative — avoids over-correcting
+)
+
+# ── Per-Model Configs ──────────────────────────────────────────────────────
+#
+# CRITICAL DESIGN NOTES:
+# - XLM-R-Large: best multilingual model, 355M params, 24 layers
+#   Lower LR (8e-6) + LLRD (0.90) prevents catastrophic forgetting
+#   6 epochs with cosine schedule gives enough time to converge
+# - BanglaBERT-Large: Bangla-specific ELECTRA-large, 24 layers
+#   Slightly higher LR (1e-5) since it's already Bangla-native
+# - EfficientNet-B4-NS: Best accuracy/size tradeoff for vision
+#   Noisy Student pretraining is superior for transfer learning
+#   Higher LR (3e-4) for vision backbone (standard for timm)
+#
+MODEL_CFGS = [
+    # ── Text Model: Base BanglaBERT (Fast, high batch size) ──────────────
+    dict(
+        key         = "banglabert_base",
+        model_name  = "csebuetnlp/banglabert",
+        type        = "text",
+        epochs      = 5,
+        lr          = 2e-5,
+        batch       = 16,       # Base model fits easily
+        grad_acc    = 2,        # Effective batch 32
+        fp16        = True,
+        grad_ckpt   = True,
+        max_len     = 128,      
+        use_rdrop   = True,     # We can afford R-Drop on base model
+        rdrop_alpha = 0.30,
+        use_awp     = False,
+        awp_start   = 2,
+        awp_lr      = 1e-4,
+        awp_eps     = 1e-3,
+        use_llrd    = True,
+        llrd_decay  = 0.95,     # 0.95 is standard for 12-layer base models
+        use_ema     = False,    # Disabled to prevent early-epoch score suppression
+        ema_decay   = 0.999,
+        label_smooth= 0.05,
+        focal_gamma = 2.0,
+    ),
+    # ── Vision Model: EfficientNet-B4-NS ──────────────────────────────────
+    dict(
+        key         = "efficientnet",
+        model_name  = "tf_efficientnet_b4_ns",
+        type        = "vision",
+        epochs      = 10,
+        lr          = 3e-4,
+        backbone_lr = 3e-5,     # 10x lower for pretrained backbone
+        batch       = 4,
+        grad_acc    = 4,        # Effective batch size 16
+        img_size    = 380,      # EfficientNet-B4 native resolution
+        mixup_alpha = 0.4,
+        cutmix_alpha= 0.4,
+        drop_rate   = 0.30,
+        tta_n       = 5,
+        fp16        = True,
+        label_smooth= 0.05,
+        focal_gamma = 2.0,
+    ),
+]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CELL 3: Data Loading & Feature Engineering
+# ═══════════════════════════════════════════════════════════════════════════════
+print(f"[{elapsed()}] Loading data...")
+train_raw = pd.read_csv(os.path.join(BASE_PATH, "train.csv"))
+val_raw   = pd.read_csv(os.path.join(BASE_PATH, "validation.csv"))
+test      = pd.read_csv(os.path.join(BASE_PATH, "test.csv"))
+
+train_raw["img_split"] = "train"
+val_raw["img_split"]   = "validation"
+test["img_split"]      = "test"
+
+# ── Bayesian Prior: computed BEFORE merging train+val ──────────────────────
+# Use val distribution more heavily since test likely resembles val more than train
+cross_all = pd.crosstab(
+    pd.concat([train_raw, val_raw], ignore_index=True)["category"],
+    pd.concat([train_raw, val_raw], ignore_index=True)["label"].map(label_map),
+    normalize="index"
+)
+cross_val = pd.crosstab(
+    val_raw["category"],
+    val_raw["label"].map(label_map),
+    normalize="index"
+)
+
+BAYESIAN_PRIORS = {}
+for cat in cross_all.index:
+    p_all = cross_all.loc[cat].reindex(range(5), fill_value=0).values
+    p_val = cross_val.loc[cat].reindex(range(5), fill_value=0).values if cat in cross_val.index else p_all
+    # Weight val distribution more since test likely follows val's distribution
+    BAYESIAN_PRIORS[cat] = 0.40 * p_all + 0.60 * p_val
+BAYESIAN_PRIORS["Non Disaster"] = np.array([1.00, 0.00, 0.00, 0.00, 0.00])
+
+# ── Merge all labeled data ─────────────────────────────────────────────────
+train = pd.concat([train_raw, val_raw]).reset_index(drop=True)
+train["label_id"] = train["label"].map(label_map)
+
+# ── Image Paths ────────────────────────────────────────────────────────────
+def get_img_path(row):
+    return os.path.join(IMG_DIRS[row["img_split"]], row["image_name"])
+
+train["image_path"] = train.apply(get_img_path, axis=1)
+test["image_path"]  = test.apply(get_img_path, axis=1)
+
+# ── Severity Keyword Detection (validated signal from EDA) ─────────────────
+# These Bengali keywords correlate strongly with Severe/Catastrophic labels
+DEATH_KWS    = ["মৃত", "নিহত", "নিখোঁজ", "হতাহত", "মৃতদেহ", "মারা গেছে", "প্রাণহানি"]
+DAMAGE_KWS   = ["ধ্বংস", "বিধ্বস্ত", "ক্ষতিগ্রস্ত", "লণ্ডভণ্ড", "ভেঙে", "ভাঙা"]
+RESCUE_KWS   = ["উদ্ধার", "সাহায্য", "ত্রাণ", "আশ্রয়"]
+
+def detect_keywords(text):
+    text = str(text)
+    has_death  = any(w in text for w in DEATH_KWS)
+    has_damage = any(w in text for w in DAMAGE_KWS)
+    has_rescue = any(w in text for w in RESCUE_KWS)
+    return has_death, has_damage, has_rescue
+
+# ── Text Feature Engineering ───────────────────────────────────────────────
+def build_text(row):
+    """
+    Construct enriched input text with validated signals:
+    1. Category prefix (80% of texts already contain it, but explicit is better)
+    2. Word count tier (correlated with severity: longer = more severe)
+    3. Death/damage keyword flags (strong severity signal)
+    4. Original context
+    """
+    cat  = row["category"]
+    ctx  = str(row["context"])
+    words = len(ctx.split())
+
+    # Bengali length descriptor
+    if words < 8:
+        tier = "সংক্ষিপ্ত"    # Brief
+    elif words <= 25:
+        tier = "মাঝারি"        # Medium
+    else:
+        tier = "বিস্তারিত"     # Detailed
+
+    has_death, has_damage, has_rescue = detect_keywords(ctx)
+
+    # Construct: "Category | দৈর্ঘ্য: tier | context"
+    # Removing keyword flags (Redundancy Trap) to let the LLM's self-attention read naturally.
+    parts = [cat, f"দৈর্ঘ্য: {tier}", ctx]
+    return " । ".join(parts)
+
+train["text"] = train.apply(build_text, axis=1)
+test["text"]  = test.apply(build_text, axis=1)
+
+# ── Stratified K-Fold ──────────────────────────────────────────────────────
+# Use StratifiedKFold on label_id to preserve class balance in each fold
+skf = StratifiedKFold(n_splits=SHARED["n_folds"], shuffle=True, random_state=SHARED["seed"])
+train["fold"] = -1
+for fold, (_, vi) in enumerate(skf.split(train, train["label_id"])):
+    train.loc[vi, "fold"] = fold
+
+# ── Class Weights (inverse frequency) ──────────────────────────────────────
+counts = train["label_id"].value_counts().sort_index().values
+CLASS_WEIGHTS = torch.tensor(np.sqrt(len(train) / (NUM_CLASSES * counts)), dtype=torch.float32)
+print(f"Class weights: {dict(zip(label_map.keys(), CLASS_WEIGHTS.numpy().round(3)))}")
+print(f"Train: {len(train)} | Test: {len(test)} | Folds: {SHARED['n_folds']}")
+print(f"[{elapsed()}] Data loaded.\n")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CELL 4: Training Utilities (AWP, EMA, LLRD, Focal Loss)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class AWP:
+    """
+    Adversarial Weight Perturbation — perturbs model weights (not just embeddings
+    like FGM) in the direction of loss gradient to improve robustness.
+
+    Key insight: Skip bias, LayerNorm, classifier, and pooler parameters since
+    perturbing those causes instability.
+    """
+    SKIP = ("bias", "LayerNorm", "layer_norm", "classifier", "pooler")
+
+    def __init__(self, model):
+        self.model  = model
+        self.backup = {}
+
+    def attack(self, adv_lr=1e-4, adv_eps=1e-3):
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad or param.grad is None:
+                continue
+            if any(s in name for s in self.SKIP):
+                continue
+            self.backup[name] = param.data.clone()
+            norm = torch.norm(param.grad)
+            if norm != 0 and not torch.isnan(norm):
+                r = adv_lr * param.grad / norm
+                param.data.add_(r)
+                param.data = torch.clamp(
+                    param.data,
+                    self.backup[name] - adv_eps,
+                    self.backup[name] + adv_eps
+                )
+
+    def restore(self):
+        for name, param in self.model.named_parameters():
+            if name in self.backup:
+                param.data = self.backup[name]
+        self.backup = {}
+
+
+class EMA:
+    """
+    Exponential Moving Average of model parameters.
+    Maintains shadow weights that are a smoothed average of training weights.
+    Used at eval/predict time for better generalization.
+    """
+    def __init__(self, model, decay=0.999):
+        self.model  = model
+        self.decay  = decay
+        self.shadow = {}
+        self.backup = {}
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+
+    def update(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = (
+                    self.decay * self.shadow[name] +
+                    (1 - self.decay) * param.data
+                )
+
+    def apply_shadow(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.backup[name] = param.data.clone()
+                param.data = self.shadow[name]
+
+    def restore(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and name in self.backup:
+                param.data = self.backup[name]
+        self.backup = {}
+
+
+def get_llrd_params(model, base_lr, weight_decay=0.01, decay=0.90):
+    """
+    Layer-wise Learning Rate Decay: lower layers get exponentially smaller LR.
+    This prevents catastrophic forgetting of pretrained representations while
+    allowing the top layers + classifier to adapt quickly.
+    """
+    no_decay = ("bias", "LayerNorm.weight", "LayerNorm.bias",
+                "layer_norm.weight", "layer_norm.bias")
+
+    n_layers = getattr(model.config, "num_hidden_layers",
+                       getattr(model.config, "num_layers", 12))
+
+    def depth(name):
+        if any(h in name for h in ("classifier", "pooler", "head")):
+            return n_layers + 1
+        if "embeddings" in name or "patch_embed" in name:
+            return 0
+        m = (re.search(r"\.layer\.(\d+)\.", name) or
+             re.search(r"\.blocks\.(\d+)\.", name))
+        return int(m.group(1)) + 1 if m else n_layers
+
+    groups = defaultdict(lambda: {"decay": [], "no_decay": []})
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        d = depth(name)
+        key = "no_decay" if any(nd in name for nd in no_decay) else "decay"
+        groups[d][key].append(param)
+
+    param_groups = []
+    max_depth = n_layers + 1
+    for d, ps in groups.items():
+        lr = base_lr * (decay ** (max_depth - d))
+        if ps["decay"]:
+            param_groups.append({"params": ps["decay"], "lr": lr, "weight_decay": weight_decay})
+        if ps["no_decay"]:
+            param_groups.append({"params": ps["no_decay"], "lr": lr, "weight_decay": 0.0})
+
+    return param_groups
+
+
+def focal_ce_loss(logits, labels, class_weights, label_smoothing=0.05, gamma=2.0):
+    """
+    Focal Cross-Entropy Loss with class weights and label smoothing.
+
+    Why focal: Standard CE treats all samples equally. Focal loss
+    down-weights easy/confident predictions and focuses the model on
+    hard-to-classify samples (like Catastrophic with only 7% samples).
+    """
+    wt = class_weights.to(logits.device)
+    ce = nn.CrossEntropyLoss(
+        weight=wt, label_smoothing=label_smoothing, reduction="none"
+    )(logits, labels)
+
+    if gamma == 0:
+        return ce.mean()
+
+    pt = torch.exp(-ce)
+    focal = ((1 - pt) ** gamma) * ce
+    return focal.mean()
+
+
+def compute_metrics(pred):
+    labels = pred.label_ids
+    preds  = pred.predictions.argmax(-1)
+    _, _, f1, _ = precision_recall_fscore_support(
+        labels, preds, average="weighted", zero_division=0
+    )
+    acc = accuracy_score(labels, preds)
+    return {"accuracy": acc, "f1": f1}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CELL 5: Text Training Engine
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TextTrainer(Trainer):
+    """
+    Advanced HF Trainer subclass with:
+    - Focal CE loss with class weights + label smoothing
+    - R-Drop consistency regularization (optional per model)
+    - AWP adversarial training (enabled after awp_start epochs)
+    - EMA shadow weights for eval/predict
+    - LLRD optimizer
+    """
+    def __init__(self, *args, mcfg=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.mcfg = mcfg
+        self._ema = None
+        self._step_count = 0
+
+    def _focal_ce(self, logits, labels):
+        return focal_ce_loss(
+            logits, labels, CLASS_WEIGHTS,
+            self.mcfg["label_smooth"],
+            self.mcfg["focal_gamma"],
+        )
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        labels = inputs.pop("labels")
+        mcfg = self.mcfg
+
+        # R-Drop: two forward passes with different dropout masks
+        use_rdrop = (
+            model.training and
+            mcfg["use_rdrop"] and
+            not getattr(self, "_awp_mode", False)
+        )
+
+        if use_rdrop:
+            out1 = model(**inputs)
+            out2 = model(**inputs)
+            ce = (self._focal_ce(out1.logits, labels) +
+                  self._focal_ce(out2.logits, labels)) / 2
+
+            p1 = F.softmax(out1.logits, dim=-1)
+            p2 = F.softmax(out2.logits, dim=-1)
+            kl = (
+                F.kl_div(out1.logits.log_softmax(-1), p2, reduction="batchmean") +
+                F.kl_div(out2.logits.log_softmax(-1), p1, reduction="batchmean")
+            ) / 2
+
+            loss = ce + mcfg["rdrop_alpha"] * kl
+            return (loss, out1) if return_outputs else loss
+        else:
+            out = model(**inputs)
+            loss = self._focal_ce(out.logits, labels)
+            return (loss, out) if return_outputs else loss
+
+    def training_step(self, model, inputs, num_items_in_batch=None, **kwargs):
+        mcfg = self.mcfg
+
+        # Initialize EMA on first step
+        if mcfg["use_ema"] and self._ema is None:
+            self._ema = EMA(self.model, decay=mcfg["ema_decay"])
+
+        self._step_count += 1
+        model.train()
+        inputs = self._prepare_inputs(inputs)
+        labels = inputs["labels"].clone()
+
+        # ── Normal forward + backward ──────────────────────────────────
+        with self.compute_loss_context_manager():
+            loss = self.compute_loss(model, inputs)
+
+        scale = self.args.gradient_accumulation_steps
+        if scale > 1:
+            loss = loss / scale
+        self.accelerator.backward(loss)
+
+        # ── AWP adversarial backward (only after awp_start epochs) ─────
+        current_epoch = getattr(self.state, "epoch", 0.0)
+        if mcfg["use_awp"] and current_epoch >= mcfg["awp_start"]:
+            awp = AWP(model)
+            awp.attack(adv_lr=mcfg["awp_lr"], adv_eps=mcfg["awp_eps"])
+            inputs["labels"] = labels
+            self._awp_mode = True
+            with self.compute_loss_context_manager():
+                loss_adv = self.compute_loss(model, inputs)
+            self._awp_mode = False
+            if scale > 1:
+                loss_adv = loss_adv / scale
+            self.accelerator.backward(loss_adv)
+            awp.restore()
+
+        # ── EMA update ─────────────────────────────────────────────────
+        if mcfg["use_ema"] and self._ema is not None:
+            self._ema.update()
+
+        return loss.detach()
+
+    def create_optimizer(self):
+        if self.optimizer is None and self.mcfg["use_llrd"]:
+            params = get_llrd_params(
+                self.model,
+                self.args.learning_rate,
+                self.args.weight_decay,
+                self.mcfg["llrd_decay"],
+            )
+            self.optimizer = torch.optim.AdamW(params, eps=1e-6, betas=(0.9, 0.999))
+        elif self.optimizer is None:
+            self.optimizer = super().create_optimizer()
+        return self.optimizer
+
+    def evaluate(self, *args, **kwargs):
+        if self.mcfg["use_ema"] and self._ema is not None:
+            self._ema.apply_shadow()
+        result = super().evaluate(*args, **kwargs)
+        if self.mcfg["use_ema"] and self._ema is not None:
+            self._ema.restore()
+        return result
+
+    def predict(self, *args, **kwargs):
+        if self.mcfg["use_ema"] and self._ema is not None:
+            self._ema.apply_shadow()
+        result = super().predict(*args, **kwargs)
+        if self.mcfg["use_ema"] and self._ema is not None:
+            self._ema.restore()
+        return result
+
+
+def train_text_model(mcfg, train_df, test_df):
+    """Train a text model with 5-fold CV and return test predictions."""
+    key = mcfg["key"]
+    print(f"\n{'='*60}")
+    print(f"  TEXT MODEL: {key.upper()} ({mcfg['model_name']})")
+    print(f"{'='*60}")
+
+    tokenizer = AutoTokenizer.from_pretrained(mcfg["model_name"])
+    def tok_fn(examples):
+        return tokenizer(
+            examples["text"],
+            padding="max_length",
+            truncation=True,
+            max_length=mcfg["max_len"],
+        )
+
+    tok_test = HFDataset.from_pandas(test_df[["text"]]).map(tok_fn, batched=True)
+    fold_preds = []
+    cv_f1s = []
+
+    for fold in range(SHARED["n_folds"]):
+        t_start = time.time()
+        print(f"\n  ── [{key}] FOLD {fold+1}/{SHARED['n_folds']} ──")
+
+        seed_everything(SHARED["seed"] + fold)
+
+        trn_df = train_df[train_df["fold"] != fold].reset_index(drop=True)
+        val_df = train_df[train_df["fold"] == fold].reset_index(drop=True)
+
+        tok_trn = (
+            HFDataset.from_pandas(
+                trn_df[["text", "label_id"]].rename(columns={"label_id": "label"})
+            ).map(tok_fn, batched=True)
+        )
+        tok_val = (
+            HFDataset.from_pandas(
+                val_df[["text", "label_id"]].rename(columns={"label_id": "label"})
+            ).map(tok_fn, batched=True)
+        )
+
+        model = AutoModelForSequenceClassification.from_pretrained(
+            mcfg["model_name"], num_labels=NUM_CLASSES
+        )
+        if mcfg["grad_ckpt"]:
+            model.gradient_checkpointing_enable()
+
+        out_dir = f"{WORK_DIR}{key}_f{fold}"
+        args = TrainingArguments(
+            output_dir                  = out_dir,
+            eval_strategy               = "epoch",
+            save_strategy               = "epoch",
+            learning_rate               = mcfg["lr"],
+            per_device_train_batch_size = mcfg["batch"],
+            per_device_eval_batch_size  = mcfg["batch"] * 2,
+            gradient_accumulation_steps = mcfg["grad_acc"],
+            num_train_epochs            = mcfg["epochs"],
+            warmup_ratio                = SHARED["warmup_ratio"],
+            lr_scheduler_type           = "cosine",
+            weight_decay                = SHARED["weight_decay"],
+            fp16                        = mcfg["fp16"],
+            load_best_model_at_end      = True,
+            metric_for_best_model       = "f1",
+            greater_is_better           = True,
+            report_to                   = "none",
+            save_total_limit            = 1,
+            logging_steps               = 50,
+        )
+
+        trainer = TextTrainer(
+            model=model, args=args,
+            train_dataset=tok_trn, eval_dataset=tok_val,
+            compute_metrics=compute_metrics, mcfg=mcfg,
+        )
+        trainer.train()
+
+        # Extract best fold F1
+        best_f1 = max(
+            trainer.state.log_history,
+            key=lambda x: x.get("eval_f1", -1)
+        ).get("eval_f1", 0)
+        cv_f1s.append(best_f1)
+
+        # Predict on test
+        preds = trainer.predict(tok_test).predictions
+        fold_preds.append(preds)
+
+        t_elapsed = (time.time() - t_start) / 60
+        print(f"  Fold {fold+1} F1: {best_f1:.4f} | Time: {t_elapsed:.1f} min | Total: {elapsed()}")
+
+        # Cleanup
+        del model, trainer
+        gc.collect()
+        torch.cuda.empty_cache()
+        if os.path.exists(out_dir):
+            shutil.rmtree(out_dir, ignore_errors=True)
+
+    mean_f1 = np.mean(cv_f1s)
+    print(f"\n  [{key}] Mean CV F1: {mean_f1:.4f} | Folds: {cv_f1s}")
+    return np.array(fold_preds), mean_f1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CELL 6: Vision Training Engine
+# ═══════════════════════════════════════════════════════════════════════════════
+
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD  = (0.229, 0.224, 0.225)
+
+def get_train_transform(img_size):
+    """
+    Heavy augmentation for vision training.
+    These augmentations simulate real-world disaster image variations:
+    - Geometric: crops, rotations, flips (different camera angles)
+    - Color: brightness, contrast, hue (different lighting conditions)
+    - Dropout: CoarseDropout (simulates occlusion/partial views)
+    """
+    return A.Compose([
+        A.RandomResizedCrop(size=(img_size, img_size), scale=(0.8, 1.0)),
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.1),
+        A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
+        A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=25, val_shift_limit=20, p=0.4),
+        A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.10, rotate_limit=15, p=0.4),
+        A.CoarseDropout(
+            max_holes=8, max_height=img_size // 8, max_width=img_size // 8,
+            fill_value=0, p=0.3
+        ),
+        A.GaussNoise(var_limit=(5.0, 25.0), p=0.2),
+        A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        ToTensorV2(),
+    ])
+
+def get_val_transform(img_size):
+    return A.Compose([
+        A.Resize(height=img_size, width=img_size),
+        A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        ToTensorV2(),
+    ])
+
+def get_tta_transforms(img_size):
+    """5 TTA augmentations: original, hflip, vflip, brightness, center-crop."""
+    base_norm = [A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD), ToTensorV2()]
+    return [
+        A.Compose([A.Resize(height=img_size, width=img_size)] + base_norm),
+        A.Compose([A.Resize(height=img_size, width=img_size), A.HorizontalFlip(p=1.0)] + base_norm),
+        A.Compose([A.Resize(height=img_size, width=img_size), A.VerticalFlip(p=1.0)] + base_norm),
+        A.Compose([A.Resize(height=img_size, width=img_size),
+                    A.RandomBrightnessContrast(brightness_limit=0.1, contrast_limit=0.1, p=1.0)] + base_norm),
+        A.Compose([A.Resize(height=int(img_size * 1.1), width=int(img_size * 1.1)),
+                    A.CenterCrop(height=img_size, width=img_size)] + base_norm),
+    ]
+
+
+class DisasterImageDataset(TorchDataset):
+    def __init__(self, df, transform, has_label=True):
+        self.df = df.reset_index(drop=True)
+        self.transform = transform
+        self.has_label = has_label
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        try:
+            img = np.array(Image.open(row["image_path"]).convert("RGB"))
+        except Exception:
+            img = np.zeros((380, 380, 3), dtype=np.uint8)
+        img = self.transform(image=img)["image"]
+        if self.has_label:
+            return img, torch.tensor(row["label_id"], dtype=torch.long)
+        return img
+
+
+class ImageClassifier(nn.Module):
+    """
+    EfficientNet backbone + BN + Dropout + Linear head.
+    Uses global average pooling from timm backbone.
+    """
+    def __init__(self, model_name, num_classes=5, drop_rate=0.3):
+        super().__init__()
+        self.backbone = timm.create_model(
+            model_name, pretrained=True, num_classes=0, global_pool="avg"
+        )
+        n_feat = self.backbone.num_features
+        self.head = nn.Sequential(
+            nn.BatchNorm1d(n_feat),
+            nn.Dropout(drop_rate),
+            nn.Linear(n_feat, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(drop_rate * 0.5),
+            nn.Linear(512, num_classes),
+        )
+
+    def forward(self, x):
+        features = self.backbone(x)
+        return self.head(features)
+
+
+def mixup_data(x, y, alpha=0.4):
+    """Mixup: creates convex combinations of training examples."""
+    lam = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
+    idx = torch.randperm(x.size(0), device=x.device)
+    return lam * x + (1 - lam) * x[idx], y, y[idx], lam
+
+
+def cutmix_data(x, y, alpha=0.4):
+    """CutMix: cuts and pastes patches between training images."""
+    lam = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
+    idx = torch.randperm(x.size(0), device=x.device)
+    B, C, H, W = x.shape
+
+    cut_rat = np.sqrt(1.0 - lam)
+    cut_w = int(W * cut_rat)
+    cut_h = int(H * cut_rat)
+    cx = np.random.randint(W)
+    cy = np.random.randint(H)
+
+    x1 = np.clip(cx - cut_w // 2, 0, W)
+    y1 = np.clip(cy - cut_h // 2, 0, H)
+    x2 = np.clip(cx + cut_w // 2, 0, W)
+    y2 = np.clip(cy + cut_h // 2, 0, H)
+
+    x_new = x.clone()
+    x_new[:, :, y1:y2, x1:x2] = x[idx, :, y1:y2, x1:x2]
+
+    # Adjust lambda to exact pixel ratio
+    lam = 1 - ((x2 - x1) * (y2 - y1) / (W * H))
+    return x_new, y, y[idx], lam
+
+
+def train_vision_model(mcfg, train_df, test_df):
+    """Train a vision model with 5-fold CV and return test predictions."""
+    key = mcfg["key"]
+    print(f"\n{'='*60}")
+    print(f"  VISION MODEL: {key.upper()} ({mcfg['model_name']})")
+    print(f"{'='*60}")
+
+    fold_preds = []
+    cv_f1s = []
+    tta_transforms = get_tta_transforms(mcfg["img_size"])
+
+    for fold in range(SHARED["n_folds"]):
+        t_start = time.time()
+        print(f"\n  ── [{key}] FOLD {fold+1}/{SHARED['n_folds']} ──")
+
+        seed_everything(SHARED["seed"] + fold)
+
+        trn_df = train_df[train_df["fold"] != fold]
+        val_df = train_df[train_df["fold"] == fold]
+
+        trn_loader = DataLoader(
+            DisasterImageDataset(trn_df, get_train_transform(mcfg["img_size"])),
+            batch_size=mcfg["batch"], shuffle=True, drop_last=True,
+            num_workers=0, pin_memory=False,  # Fixed deadlock
+        )
+        val_loader = DataLoader(
+            DisasterImageDataset(val_df, get_val_transform(mcfg["img_size"])),
+            batch_size=mcfg["batch"], shuffle=False,
+            num_workers=0, pin_memory=False,  # Fixed deadlock
+        )
+
+        model = ImageClassifier(
+            mcfg["model_name"], NUM_CLASSES, mcfg["drop_rate"]
+        ).to(DEVICE)
+
+        cw = CLASS_WEIGHTS.to(DEVICE)
+
+        # Separate LR for backbone vs head
+        optimizer = torch.optim.AdamW([
+            {"params": model.backbone.parameters(), "lr": mcfg["backbone_lr"]},
+            {"params": model.head.parameters(), "lr": mcfg["lr"]},
+        ], weight_decay=1e-2)
+
+        if torch.cuda.device_count() > 1:
+            model = nn.DataParallel(model)
+
+        total_steps = len(trn_loader) * mcfg["epochs"]
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=int(0.1 * total_steps),
+            num_training_steps=total_steps,
+        )
+        scaler = torch.cuda.amp.GradScaler()
+
+        best_f1 = 0.0
+        best_weights = None
+
+        for ep in range(mcfg["epochs"]):
+            # ── Train ──────────────────────────────────────────────
+            model.train()
+            running_loss = 0.0
+
+            for step, (imgs, labels) in enumerate(trn_loader):
+                imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
+                
+                # Apply Mixup or CutMix with 50% probability
+                use_mix = random.random() < 0.5
+                if use_mix:
+                    if random.random() < 0.5:
+                        imgs, y_a, y_b, lam = mixup_data(imgs, labels, mcfg["mixup_alpha"])
+                    else:
+                        imgs, y_a, y_b, lam = cutmix_data(imgs, labels, mcfg["cutmix_alpha"])
+
+                with torch.cuda.amp.autocast(enabled=mcfg["fp16"]):
+                    logits = model(imgs)
+                    if use_mix:
+                        loss = (
+                            lam * focal_ce_loss(logits, y_a, cw, mcfg["label_smooth"], mcfg["focal_gamma"]) +
+                            (1 - lam) * focal_ce_loss(logits, y_b, cw, mcfg["label_smooth"], mcfg["focal_gamma"])
+                        )
+                    else:
+                        loss = focal_ce_loss(logits, labels, cw, mcfg["label_smooth"], mcfg["focal_gamma"])
+                
+                # Normalize loss for accumulation
+                loss = loss / mcfg.get("grad_acc", 1)
+                scaler.scale(loss).backward()
+                
+                if (step + 1) % mcfg.get("grad_acc", 1) == 0 or (step + 1) == len(trn_loader):
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+                    scheduler.step()
+                
+                running_loss += (loss.item() * mcfg.get("grad_acc", 1))
+
+            # ── Validate ───────────────────────────────────────────
+            model.eval()
+            all_preds, all_labels = [], []
+            with torch.no_grad():
+                for imgs, labels in val_loader:
+                    with torch.cuda.amp.autocast(enabled=mcfg["fp16"]):
+                        logits = model(imgs.to(DEVICE))
+                    all_preds.extend(logits.argmax(1).cpu().numpy())
+                    all_labels.extend(labels.numpy())
+
+            _, _, f1, _ = precision_recall_fscore_support(
+                all_labels, all_preds, average="weighted", zero_division=0
+            )
+            avg_loss = running_loss / len(trn_loader)
+            print(f"    Ep {ep+1}/{mcfg['epochs']} | loss={avg_loss:.4f} | val_f1={f1:.4f}")
+
+            if f1 > best_f1:
+                best_f1 = f1
+                best_weights = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+
+        cv_f1s.append(best_f1)
+
+        # Load best weights for TTA prediction
+        model.load_state_dict({k: v.to(DEVICE) for k, v in best_weights.items()})
+        model.eval()
+
+        # ── TTA Prediction ─────────────────────────────────────────
+        tta_logits_all = []
+        for t_idx, tta_tfm in enumerate(tta_transforms):
+            loader = DataLoader(
+                DisasterImageDataset(test_df, tta_tfm, has_label=False),
+                batch_size=mcfg["batch"], shuffle=False,
+                num_workers=0, pin_memory=False, # Fixed deadlock
+            )
+            batch_logits = []
+            with torch.no_grad():
+                for imgs in loader:
+                    with torch.cuda.amp.autocast(enabled=mcfg["fp16"]):
+                        logits = model(imgs.to(DEVICE))
+                    batch_logits.append(logits.float().cpu().numpy())
+            tta_logits_all.append(np.concatenate(batch_logits))
+
+        # Average TTA predictions
+        fold_preds.append(np.mean(tta_logits_all, axis=0))
+
+        t_elapsed = (time.time() - t_start) / 60
+        print(f"  Fold {fold+1} F1: {best_f1:.4f} | Time: {t_elapsed:.1f} min | Total: {elapsed()}")
+
+        del model, best_weights
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    mean_f1 = np.mean(cv_f1s)
+    print(f"\n  [{key}] Mean CV F1: {mean_f1:.4f} | Folds: {cv_f1s}")
+    return np.array(fold_preds), mean_f1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CELL 7: Execute All Models
+# ═══════════════════════════════════════════════════════════════════════════════
+print(f"\n[{elapsed()}] Starting model training...")
+
+all_logits = {}   # key -> (n_test, n_classes) mean logits
+all_cv_f1  = {}   # key -> float mean CV F1
+
+for mcfg in MODEL_CFGS:
+    seed_everything(SHARED["seed"])
+
+    if mcfg["type"] == "text":
+        preds, cv_f1 = train_text_model(mcfg, train, test)
+    else:
+        preds, cv_f1 = train_vision_model(mcfg, train, test)
+
+    all_logits[mcfg["key"]] = preds.mean(axis=0)  # Average across folds
+    all_cv_f1[mcfg["key"]]  = cv_f1
+
+print(f"\n[{elapsed()}] All models trained.")
+print(f"CV F1 scores: {all_cv_f1}")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CELL 8: Late Fusion Ensemble + Bayesian Prior
+# ═══════════════════════════════════════════════════════════════════════════════
+print(f"\n{'='*60}")
+print(f"  LATE FUSION ENSEMBLE")
+print(f"{'='*60}")
+
+# ── CV-weighted ensemble ───────────────────────────────────────────────────
+# Models with higher CV F1 get proportionally more weight
+total_score = sum(all_cv_f1.values())
+weights = {k: v / total_score for k, v in all_cv_f1.items()}
+print(f"Ensemble weights: {weights}")
+
+# Convert logits to probabilities BEFORE ensembling (normalizes scale)
+all_probs = {k: scipy_softmax(v, axis=-1) for k, v in all_logits.items()}
+blended_probs = sum(weights[k] * all_probs[k] for k in all_probs)
+
+# ── Bayesian Prior Adjustment ──────────────────────────────────────────────
+# Multiply blended probabilities by category-specific prior
+# This exploits the known category→label distribution patterns
+alpha = SHARED["bayesian_alpha"]
+test.reset_index(drop=True, inplace=True)
+
+adjusted_logits = np.zeros_like(blended_probs)
+for i, row in test.iterrows():
+    cat = row["category"]
+    prior = BAYESIAN_PRIORS.get(cat, np.ones(5) / 5)
+    p_blend = blended_probs[i] + 1e-8
+    p_prior = prior + 1e-8
+    adjusted_logits[i] = np.log(p_blend) + alpha * np.log(p_prior)
+
+# ── Death keyword boost (validated signal) ─────────────────────────────────
+# If text mentions death/casualties, slightly boost Severe/Catastrophic
+for i, row in test.iterrows():
+    has_death, has_damage, _ = detect_keywords(row["context"])
+    cat = row["category"]
+
+    if has_death:
+        # Boost Severe and Catastrophic
+        if cat in ("Wildfire", "Flood", "Earthquake", "Landslides"):
+            adjusted_logits[i, label_map["Catastrophic"]] += 0.5
+            adjusted_logits[i, label_map["Severe"]] += 0.3
+        elif cat == "Human Damage":
+            adjusted_logits[i, label_map["Severe"]] += 0.4
+
+    if has_damage:
+        if cat in ("Earthquake", "Flood", "Wildfire"):
+            adjusted_logits[i, label_map["Severe"]] += 0.2
+
+# ── Final predictions ─────────────────────────────────────────────────────
+final_preds_pre_pseudo = np.argmax(adjusted_logits, axis=-1)
+test["label"] = [reverse_label_map[p] for p in final_preds_pre_pseudo]
+
+# ── Hard Rule: Non Disaster → Minimal (100% accuracy) ─────────────────────
+test.loc[test["category"] == "Non Disaster", "label"] = "Minimal"
+
+print(f"\nPre-pseudo prediction distribution:")
+print(test["label"].value_counts())
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CELL 9: Pseudo-Labeling (2 Rounds)
+# ═══════════════════════════════════════════════════════════════════════════════
+PSEUDO_CFG = dict(
+    threshold_r1 = 0.92,   # Round 1: very conservative
+    threshold_r2 = 0.88,   # Round 2: slightly more aggressive
+    epochs       = 3,
+    lr           = 5e-6,   # Very low LR to prevent forgetting
+    blend_weight = 0.25,   # 75% ensemble + 25% pseudo
+)
+
+# Use the best text model for pseudo-labeling
+best_text_key = max(
+    (k for k in all_cv_f1 if any(c["key"] == k and c["type"] == "text" for c in MODEL_CFGS)),
+    key=lambda k: all_cv_f1[k]
+)
+best_text_cfg = next(c for c in MODEL_CFGS if c["key"] == best_text_key)
+print(f"\n[{elapsed()}] Pseudo-labeling with {best_text_key} (CV F1: {all_cv_f1[best_text_key]:.4f})")
+
+# Compute confidence from blended probabilities
+probs_for_pseudo = scipy_softmax(adjusted_logits, axis=-1)
+max_probs = probs_for_pseudo.max(axis=-1)
+
+for round_idx, threshold in enumerate([PSEUDO_CFG["threshold_r1"], PSEUDO_CFG["threshold_r2"]]):
+    confident = max_probs >= threshold
+
+    # Exclude Non Disaster from pseudo-labeling (already 100% correct)
+    confident = confident & (test["category"] != "Non Disaster").values
+
+    n_confident = confident.sum()
+    print(f"\n  Round {round_idx+1}: {n_confident} confident samples (threshold={threshold})")
+
+    if n_confident < 30:
+        print(f"  Too few confident samples; skipping round {round_idx+1}.")
+        continue
+
+    pseudo_df = test[confident].copy()
+    pseudo_df["label_id"] = final_preds_pre_pseudo[confident]
+
+    full_train = pd.concat(
+        [train[["text", "label_id"]], pseudo_df[["text", "label_id"]]],
+        ignore_index=True,
+    )
+    print(f"  Expanded train: {len(train)} → {len(full_train)}")
+
+    tokenizer_p = AutoTokenizer.from_pretrained(best_text_cfg["model_name"])
+    def tok_p(examples):
+        return tokenizer_p(
+            examples["text"], padding="max_length",
+            truncation=True, max_length=best_text_cfg["max_len"],
+        )
+
+    tok_full = HFDataset.from_pandas(
+        full_train.rename(columns={"label_id": "label"})
+    ).map(tok_p, batched=True)
+    tok_test_p = HFDataset.from_pandas(test[["text"]]).map(tok_p, batched=True)
+
+    pseudo_model = AutoModelForSequenceClassification.from_pretrained(
+        best_text_cfg["model_name"], num_labels=NUM_CLASSES
+    )
+    if best_text_cfg["grad_ckpt"]:
+        pseudo_model.gradient_checkpointing_enable()
+
+    # Simpler trainer for pseudo-labeling (no R-Drop, no AWP)
+    pseudo_mcfg = dict(best_text_cfg)
+    pseudo_mcfg["use_rdrop"] = False
+    pseudo_mcfg["use_awp"] = False
+    pseudo_mcfg["use_ema"] = False
+
+    p_args = TrainingArguments(
+        output_dir                  = f"{WORK_DIR}pseudo_r{round_idx}",
+        num_train_epochs            = PSEUDO_CFG["epochs"],
+        per_device_train_batch_size = best_text_cfg["batch"],
+        per_device_train_batch_size = 1,
+        per_device_eval_batch_size  = best_text_cfg["batch"] * 2,
+        gradient_accumulation_steps = 16,
+        learning_rate               = PSEUDO_CFG["lr"],
+        warmup_ratio                = 0.10,
+        lr_scheduler_type           = "cosine",
+        weight_decay                = 0.01,
+        fp16                        = best_text_cfg["fp16"],
+        save_strategy               = "no",
+        report_to                   = "none",
+    )
+
+    pseudo_trainer = TextTrainer(
+        model=pseudo_model, args=p_args,
+        train_dataset=tok_full, compute_metrics=compute_metrics,
+        mcfg=pseudo_mcfg,
+    )
+    pseudo_trainer.train()
+    pseudo_logits = pseudo_trainer.predict(tok_test_p).predictions
+
+    # Blend pseudo predictions into adjusted logits
+    pw = PSEUDO_CFG["blend_weight"]
+    pseudo_probs = scipy_softmax(pseudo_logits, axis=-1)
+    # Update the blended probs for next round
+    probs_for_pseudo = (1 - pw) * probs_for_pseudo + pw * pseudo_probs
+    max_probs = probs_for_pseudo.max(axis=-1)
+
+    del pseudo_model, pseudo_trainer
+    gc.collect()
+    torch.cuda.empty_cache()
+    out_dir = f"{WORK_DIR}pseudo_r{round_idx}"
+    if os.path.exists(out_dir):
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+    print(f"  [Round {round_idx+1}] Done. [{elapsed()}]")
+
+# ── Final prediction from pseudo-blended probabilities ─────────────────────
+# Re-apply Bayesian prior to the pseudo-blended probabilities
+final_logits = np.zeros_like(probs_for_pseudo)
+for i, row in test.iterrows():
+    cat = row["category"]
+    prior = BAYESIAN_PRIORS.get(cat, np.ones(5) / 5)
+    p = probs_for_pseudo[i] + 1e-8
+    p_prior = prior + 1e-8
+    final_logits[i] = np.log(p) + alpha * np.log(p_prior)
+
+# Let the ensemble probabilities speak for themselves.
+# The large models (XLM-R, BanglaBERT-Large) already attend to Bengali death/damage
+# keywords through self-attention. Manual logit boosts are redundant and can
+# overcorrect already-confident correct predictions (Redundancy Trap at inference time).
+final_preds = np.argmax(final_logits, axis=-1)
+test["label"] = [reverse_label_map[p] for p in final_preds]
+
+# ── Hard Rule (re-apply after pseudo) ──────────────────────────────────────
+test.loc[test["category"] == "Non Disaster", "label"] = "Minimal"
+
+# ── Suppress impossible combinations ──────────────────────────────────────
+# From EDA: Tropical Storm → Catastrophic has 0.4% probability (2/450 samples)
+# If model predicts Catastrophic for Tropical Storm, override to Severe
+test.loc[
+    (test["category"] == "Tropical Storm") & (test["label"] == "Catastrophic"),
+    "label"
+] = "Severe"
+
+# From EDA: Flood → Minimal has 0.2% probability (1/450 samples)
+test.loc[
+    (test["category"] == "Flood") & (test["label"] == "Minimal"),
+    "label"
+] = "Mild"
+
+# From EDA: Human Damage → Catastrophic has 1.1% probability (5/450 samples)
+# With only 5 examples in 450, this is almost certainly noise. Override to Severe.
+test.loc[
+    (test["category"] == "Human Damage") & (test["label"] == "Catastrophic"),
+    "label"
+] = "Severe"
+
+print(f"\nFinal prediction distribution:")
+print(test["label"].value_counts())
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CELL 10: Save Submission
+# ═══════════════════════════════════════════════════════════════════════════════
+submission = test[["image_id", "label"]]
+submission.to_csv("submission.csv", index=False)
+
+with zipfile.ZipFile("submission_base_vision.zip", "w") as z:
+    z.write("submission.csv", arcname="submission.csv")
+
+print(f"\n{'='*60}")
+print(f"  ✅ SUBMISSION READY: submission_ultimate_v5.zip")
+print(f"  Total runtime: {elapsed()}")
+print(f"  CV F1 scores: {all_cv_f1}")
+print(f"  Ensemble weights: {weights}")
+print(f"{'='*60}")
+print(f"\nPrediction distribution:")
+print(submission["label"].value_counts())
+print(f"\nSample predictions:")
+print(submission.head(10))
