@@ -18,7 +18,7 @@ warnings.filterwarnings("ignore")
 
 class CFG:
     seed = 42
-    base_path = r"d:\Development\iiucdatathon\CrisisMMD_v2.0"
+    base_path = "/kaggle/input/datasets/seaninggg/crisismmd-multimodal-crisis-dataset/CrisisMMD_v2.0"
     tsv_file = os.path.join(base_path, "annotations", "hurricane_harvey_final_data.tsv")
     text_model = "xlm-roberta-large"
     vision_model = "swin_tiny_patch4_window7_224"
