@@ -14,7 +14,7 @@ from sklearn.preprocessing import LabelEncoder
 import lightgbm as lgb
 import optuna
 import warnings
-from tqdm import tqdm
+from tqdm.auto import tqdm
 warnings.filterwarnings("ignore")
 
 class CFG:

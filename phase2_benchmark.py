@@ -13,7 +13,7 @@ from sklearn.metrics import f1_score, accuracy_score
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
 import warnings
-from tqdm import tqdm
+from tqdm.auto import tqdm
 warnings.filterwarnings("ignore")
 
 class CFG:
