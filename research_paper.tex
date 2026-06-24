@@ -16,16 +16,8 @@
 \usepackage{booktabs}
 \usepackage{array}
 \usepackage{balance}
-\usepackage[backend=bibtex,style=ieee]{biblatex}
-\addbibresource{references.bib}
 \usepackage[font=footnotesize,labelfont=bf,justification=raggedright,format=plain]{caption}
 \usepackage{float}
-
-% -----------------------------
-% Bibliography Heading
-% -----------------------------
-\defbibheading{bibliography}[\refname]{%
-  \section{\MakeUppercase{REFERENCES}}}
 
 % -----------------------------
 % Custom Column Types
@@ -285,6 +277,37 @@ This paper presented an end-to-end, resource-constrained multimodal architecture
 
 \balance
 \fontsize{11}{13}\selectfont
-\printbibliography
+
+% -----------------------------
+% Hardcoded Bibliography
+% -----------------------------
+\section{\MakeUppercase{REFERENCES}}
+\begin{thebibliography}{9}
+
+\bibitem{swin}
+Z. Liu, Y. Lin, Y. Cao, H. Hu, Y. Wei, Z. Zhang, S. Lin, and B. Guo, ``Swin transformer: Hierarchical vision transformer using shifted windows,'' in \emph{Proceedings of the IEEE/CVF international conference on computer vision}, 2021, pp. 10012--10022.
+
+\bibitem{banglabert}
+A. Bhattacharjee, T. Hasan, W. U. Ahmad, K. S. Mubasshir, M. S. Islam, A. Iqbal, M. S. Rahman, and R. Shahriyar, ``BanglaBERT: Language Model Pretraining and Benchmarks for Low-Resource Language Understanding Evaluation in Bangla,'' in \emph{Findings of the Association for Computational Linguistics: NAACL 2022}, 2022, pp. 1318--1327.
+
+\bibitem{xlmr}
+A. Conneau, K. Khandelwal, N. Goyal, V. Chaudhary, G. Wenzek, F. Guzm{\'a}n, E. Grave, M. Ott, L. Zettlemoyer, and V. Stoyanov, ``Unsupervised Cross-lingual Representation Learning at Scale,'' in \emph{Proceedings of the 58th Annual Meeting of the Association for Computational Linguistics}, 2020, pp. 8440--8451.
+
+\bibitem{fgm}
+T. Miyato, A. M. Dai, and I. Goodfellow, ``Adversarial training methods for semi-supervised text classification,'' \emph{arXiv preprint arXiv:1605.07725}, 2016.
+
+\bibitem{crisismmd}
+F. Alam, F. Ofli, and M. Imran, ``Crisismmd: Multimodal twitter datasets from natural disasters,'' in \emph{Proceedings of the International AAAI Conference on Web and Social Media}, vol. 12, no. 1, 2018.
+
+\bibitem{pseudo}
+D.-H. Lee, ``Pseudo-label: The simple and efficient semi-supervised learning method for deep neural networks,'' in \emph{Workshop on challenges in representation learning, ICML}, vol. 3, no. 2, 2013, p. 896.
+
+\bibitem{lightgbm}
+G. Ke, Q. Meng, T. Finley, T. Wang, W. Chen, W. Ma, Q. Ye, and T.-Y. Liu, ``Lightgbm: A highly efficient gradient boosting decision tree,'' in \emph{Advances in neural information processing systems}, vol. 30, 2017.
+
+\bibitem{optuna}
+T. Akiba, S. Sano, T. Yanase, T. Ohta, and M. Koyama, ``Optuna: A next-generation hyperparameter optimization framework,'' in \emph{Proceedings of the 25th ACM SIGKDD international conference on knowledge discovery \& data mining}, 2019, pp. 2623--2631.
+
+\end{thebibliography}
 
 \end{document}
