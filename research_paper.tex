@@ -151,7 +151,7 @@ Multimodal Disaster Assessment, Dual-Encoder Architecture, Fast Gradient Method,
 \section{Introduction}
 \fontsize{11}{13}\selectfont
 
-In the immediate aftermath of a catastrophic natural or human-induced disaster, the velocity and accuracy of severity assessment directly dictate the success of emergency response protocols. Real-time situational awareness is increasingly derived from two primary, yet highly divergent, data streams: Unmanned Aerial Vehicle (UAV) visual surveillance and crowd-sourced social media text. Combining these modalities provides a holistic view of the event, fusing the macro-level geographic destruction captured by drones with the micro-level human context broadcasted by victims and witnesses.
+In the immediate aftermath of a catastrophic natural or human-induced disaster, the velocity and accuracy of severity assessment directly dictate the success of emergency response protocols. Real-time situational awareness is increasingly derived from two primary, yet highly divergent, data streams: Unmanned Aerial Vehicle (UAV) visual surveillance and crowd-sourced social media text. Combining these modalities provides a holistic view of the event, fusing the macro-level geographic destruction captured by drones with the micro-level human context broadcasted by victims and witnesses \cite{crisismmd}.
 
 Despite its theoretical advantages, multimodal disaster assessment remains a profoundly complex engineering problem. Social media streams are notoriously noisy, featuring typographical errors, slang, and unverified claims. Furthermore, in developing nations where disasters strike with devastating frequency (e.g., severe flooding and cyclones in Bangladesh), the local languages are often computationally ``low-resource." Standard transformer-based architectures frequently suffer from routing collapse and catastrophic overfitting when processing low-resource languages like Bengali due to inadequate pre-training corpora. Similarly, UAV imagery often suffers from extreme photometric variances—such as sun glare, overcast shadows, and sensor noise—making visual feature extraction highly unstable. 
 
@@ -163,22 +163,31 @@ In this work, we present a resource-constrained, robust dual-encoder multimodal 
     \item We validate the framework's scalability, proving its high efficacy on the Bengali-centric BanglaCalamityMMD dataset (Phase 1) and demonstrating seamless global generalization on the multilingual CrisisMMD v2.0 dataset (Phase 2).
 \end{itemize}
 
+\section{Literature Review}
+\fontsize{11}{13}\selectfont
+
+Over the last decade, multimodal data fusion has gained intense traction in crisis informatics. The introduction of large-scale multimodal datasets, such as CrisisMMD \cite{crisismmd}, spurred the development of complex vision-language architectures. Early approaches concatenated standard Convolutional Neural Network (CNN) features with static word embeddings. However, these systems struggled with semantic noise and lacked spatial attention.
+
+The advent of Vision Transformers, particularly the Shifted-Window (Swin) Transformer \cite{swin}, revolutionized visual feature extraction by providing local-to-global hierarchical attention with significantly lower computational overhead than standard ViTs, making it ideal for high-resolution UAV imagery. Concurrently, massive strides in natural language processing (NLP) yielded globally resilient models like XLM-RoBERTa \cite{xlmr}. For highly localized, low-resource languages, domain-specific models such as BanglaBERT \cite{banglabert} have proven necessary to capture complex morphological nuances that global models overlook.
+
+To counter the fragility of deep neural networks against noise, Miyato et al. introduced the Fast Gradient Method (FGM) for adversarial training in the text domain \cite{fgm}. However, applying FGM universally across multimodal networks often deteriorates visual manifolds. Additionally, the challenges of unannotated data and extreme class imbalance have traditionally been addressed by Pseudo-Labeling \cite{pseudo} and Gradient Boosting frameworks like LightGBM \cite{lightgbm}, though rarely combined into a unified, dynamically optimized pipeline for disaster assessment.
+
 \section{Methodology}
 \fontsize{11}{13}\selectfont
 
 To effectively parse the disjointed semantic and visual disaster manifolds, our architecture maintains independent feature pathways before executing a dense late-stage projection.
 
 \subsection{Multimodal Dual-Encoder Late Fusion}
-The visual representation pathway extracts spatial hierarchies using the \texttt{swin\_tiny\_patch4\_window7\_224} architecture. Swin Transformers compute self-attention within shifted local windows, generating a hierarchical feature map at a fraction of the computational complexity of standard Vision Transformers. To combat the scarcity of disaster variations, we apply aggressive Hue, Saturation, and Value (HSV) geometric distortions during training. 
+The visual representation pathway extracts spatial hierarchies using the \texttt{swin\_tiny\_patch4\_window7\_224} architecture \cite{swin}. Swin Transformers compute self-attention within shifted local windows, generating a hierarchical feature map at a fraction of the computational complexity of standard Vision Transformers. To combat the scarcity of disaster variations, we apply aggressive Hue, Saturation, and Value (HSV) geometric distortions during training. 
 
-The semantic pathway is powered by \texttt{csebuetnlp/banglabert} for localized Bengali tasks, and \texttt{xlm-roberta-large} for global generalization. Both encoders process the text into a comprehensive pooled representation. The output arrays are concatenated to form the dense multi-modal feature vector $f_{mm}$:
+The semantic pathway is powered by \texttt{csebuetnlp/banglabert} \cite{banglabert} for localized Bengali tasks, and \texttt{xlm-roberta-large} \cite{xlmr} for global generalization. Both encoders process the text into a comprehensive pooled representation. The output arrays are concatenated to form the dense multi-modal feature vector $f_{mm}$:
 \begin{equation}
     f_{mm} = \text{Concat}(f_{vision}, f_{text})
 \end{equation}
 This feature vector is passed through a regularizing dropout layer ($p=0.3$) and mapped to the $k$ severity classes using a linear classification head: $z = W_f f_{mm} + b_f$.
 
 \subsection{Targeted Adversarial Training (FGM)}
-Standard adversarial training techniques like the Fast Gradient Method (FGM) globally perturb all trainable parameters. In a highly-augmented multimodal setting, globally applying FGM often destroys the visual spatial coherence established by the Swin-Tiny backbone. Therefore, we introduce a targeted adversarial block. We strictly calculate the adversarial noise $r_{adv}$ over the text encoder's \texttt{word\_embeddings}:
+Standard adversarial training techniques like the Fast Gradient Method (FGM) \cite{fgm} globally perturb all trainable parameters. In a highly-augmented multimodal setting, globally applying FGM often destroys the visual spatial coherence established by the Swin-Tiny backbone. Therefore, we introduce a targeted adversarial block. We strictly calculate the adversarial noise $r_{adv}$ over the text encoder's \texttt{word\_embeddings}:
 \begin{equation}
     r_{adv} = \epsilon \frac{\nabla_e \mathcal{L}(e, y)}{||\nabla_e \mathcal{L}(e, y)||_2}
 \end{equation}
@@ -188,10 +197,10 @@ where $e$ represents the word embeddings and $\epsilon$ is the scaling factor. T
 Due to the stringent memory constraints of edge-deployable hardware, we utilize FP16 Mixed Precision training. Multimodal optimization often experiences transient exploding gradients, causing the dynamic loss scaler to collapse to \texttt{NaN}. To ensure training continuity, we deploy a gradient anomaly safeguard. If the scaler shrinks consecutively ($\text{scale}_{t} < \text{scale}_{t-1}$), the optimizer and scheduler steps are explicitly skipped, allowing the gradients to stabilize dynamically.
 
 \subsection{Dynamic Pseudo-Labeling Strategy (DIPS)}
-Real-world disaster datasets possess enormous long-tail class imbalances. To augment our training distribution organically, we implement DIPS over unannotated test streams. DIPS monitors the softmax prediction distributions across three sequential epochs. An unannotated sample $x_i$ is promoted to the pseudo-ground-truth set $D_{pseudo}$ only if its mean confidence exceeds a strict threshold ($\mu_{conf} \ge 0.85$) while maintaining minimal epistemic uncertainty ($\sigma_{conf} \le 0.15$). This vetted data acts as an anchor during the final fine-tuning phase.
+Real-world disaster datasets possess enormous long-tail class imbalances. To augment our training distribution organically, we implement DIPS over unannotated test streams, inspired by standard pseudo-labeling \cite{pseudo}. DIPS monitors the softmax prediction distributions across three sequential epochs. An unannotated sample $x_i$ is promoted to the pseudo-ground-truth set $D_{pseudo}$ only if its mean confidence exceeds a strict threshold ($\mu_{conf} \ge 0.85$) while maintaining minimal epistemic uncertainty ($\sigma_{conf} \le 0.15$). This vetted data acts as an anchor during the final fine-tuning phase.
 
 \subsection{Optuna-Calibrated LightGBM Stacking}
-Finally, the standard Cross-Entropy loss naturally biases predictions toward the majority class. We resolve this log-bias shift post-training using a stacking framework. We extract Out-Of-Fold (OOF) multimodal features from the validation partitions and train a Level-2 LightGBM classifier. We utilize Optuna to perform an extensive Bayesian hyperparameter search over the LightGBM learning rate, leaf volume, and boosting rounds, optimizing directly for the Macro F1-score.
+Finally, the standard Cross-Entropy loss naturally biases predictions toward the majority class. We resolve this log-bias shift post-training using a stacking framework. We extract Out-Of-Fold (OOF) multimodal features from the validation partitions and train a Level-2 LightGBM classifier \cite{lightgbm}. We utilize Optuna \cite{optuna} to perform an extensive Bayesian hyperparameter search over the LightGBM learning rate, leaf volume, and boosting rounds, optimizing directly for the Macro F1-score.
 
 \section{Experiments and Results}
 \fontsize{11}{13}\selectfont
@@ -250,6 +259,13 @@ Hurricane Irma (Florida) & 0.748 & 0.817 \\
 \end{table}
 
 The empirical results in Table \ref{table2} confirm exceptional generalization capability. Our model securely maintains a $\sim0.75$ Macro F1 score across heavily distinct geographic catastrophes without any architectural restructuring, verifying the universal robustness of the Targeted FGM and DIPS algorithms.
+
+\section{Discussion}
+\fontsize{11}{13}\selectfont
+
+The experimental outcomes confirm that isolated architectural enhancements—specifically restricting adversarial noise to the semantic domain—create a synergistic effect when coupled with LightGBM log-bias correction. Unlike previous models that suffer from routing collapse during bimodal processing, the Swin-Tiny backbone proved computationally lean enough to operate alongside large transformer models without overflowing FP16 memory bounds. 
+
+A primary limitation of this approach is the reliance on the Optuna hyperparameter search for the Level-2 LightGBM classifier. While highly accurate, stacking OOF features requires storing massive intermediate representations, which poses a barrier to instantaneous edge-device deployment. Future iterations of this architecture will explore knowledge distillation techniques to compress the Level-2 stacking logic directly back into the primary classification head, preserving the F1 improvements without the secondary inference cost.
 
 \section{Conclusion}
 \fontsize{11}{13}\selectfont
