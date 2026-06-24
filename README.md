@@ -46,5 +46,3 @@ This project is optimized to run flawlessly within a Kaggle Notebook utilizing d
 5. **Cell 2:** Paste the contents of `phase2_benchmark.py` and execute to run the Generalization Test.
 6. **Cell 3:** Paste the contents of `phase3_results_visualization.py` and execute to visualize your F1 scores.
 
-## Research Paper
-The LaTeX source code for the associated academic research paper detailing the mathematical background of the targeted FGM and DIPS strategy is available in `research_paper.tex`. It is natively formatted for single-file compilation in Overleaf.

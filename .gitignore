@@ -19,3 +19,5 @@ __pycache__/
 .agent/
 
 *.tex
+research_paper.tex
+references.bib
