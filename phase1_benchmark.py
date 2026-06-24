@@ -20,9 +20,9 @@ warnings.filterwarnings("ignore")
 class CFG:
     seed = 42
     base_path = "/kaggle/input/datasets/ju4700/banglaclamity/BanglaCalamityMMD"
-    train_csv = os.path.join(base_path, "train.csv")
-    valid_csv = os.path.join(base_path, "validation.csv")
-    test_csv = os.path.join(base_path, "test.csv")
+    train_csv = os.path.join(base_path, "Disaster_train.csv")
+    valid_csv = os.path.join(base_path, "Disaster_validation.csv")
+    test_csv = os.path.join(base_path, "Disaster_test.csv")
     text_model = "csebuetnlp/banglabert"
     vision_model = "swin_tiny_patch4_window7_224"
     max_len = 128
