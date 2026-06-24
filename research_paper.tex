@@ -84,7 +84,7 @@
 % -----------------------------
 % Title / Author
 % -----------------------------
-\title{\fontsize{16}{20}\selectfont\textbf{RESOURCE-CONSTRAINED MULTIMODAL DISASTER ASSESSMENT: A NOISE-RESILIENT FUSION ARCHITECTURE FOR LOW-RESOURCE AND HIGH-RESOURCE ENVIRONMENTS}}
+\title{\fontsize{16}{20}\selectfont\textbf{MULTIMODAL DISASTER IDENTIFICATION AND ASSESSMENT: A NOISE-RESILIENT FUSION ARCHITECTURE FOR LOW-RESOURCE AND HIGH-RESOURCE ENVIRONMENTS}}
 
 \author{
     \fontsize{12}{14}\selectfont
@@ -143,7 +143,7 @@ Multimodal Disaster Assessment, Dual-Encoder Architecture, Fast Gradient Method,
 \section{Introduction}
 \fontsize{11}{13}\selectfont
 
-In the immediate aftermath of a catastrophic natural or human-induced disaster, the velocity and accuracy of severity assessment directly dictate the success of emergency response protocols. Real-time situational awareness is increasingly derived from two primary, yet highly divergent, data streams: Unmanned Aerial Vehicle (UAV) visual surveillance and crowd-sourced social media text. Combining these modalities provides a holistic view of the event, fusing the macro-level geographic destruction captured by drones with the micro-level human context broadcasted by victims and witnesses \cite{crisismmd}.
+In the immediate aftermath of a catastrophic natural or human-induced disaster, the velocity and accuracy of disaster identification directly dictate the success of emergency response protocols. Real-time situational awareness is increasingly derived from two primary, yet highly divergent, data streams: Unmanned Aerial Vehicle (UAV) visual surveillance and crowd-sourced social media text. Combining these modalities provides a holistic view of the event, fusing the macro-level geographic destruction captured by drones with the micro-level human context broadcasted by victims and witnesses \cite{crisismmd}.
 
 Despite its theoretical advantages, multimodal disaster assessment remains a profoundly complex engineering problem. Social media streams are notoriously noisy, featuring typographical errors, slang, and unverified claims. Furthermore, in developing nations where disasters strike with devastating frequency (e.g., severe flooding and cyclones in Bangladesh), the local languages are often computationally ``low-resource." Standard transformer-based architectures frequently suffer from routing collapse and catastrophic overfitting when processing low-resource languages like Bengali due to inadequate pre-training corpora. Similarly, UAV imagery often suffers from extreme photometric variances—such as sun glare, overcast shadows, and sensor noise—making visual feature extraction highly unstable. 
 
@@ -176,7 +176,7 @@ The semantic pathway is powered by \texttt{csebuetnlp/banglabert} \cite{banglabe
 \begin{equation}
     f_{mm} = \text{Concat}(f_{vision}, f_{text})
 \end{equation}
-This feature vector is passed through a regularizing dropout layer ($p=0.3$) and mapped to the $k$ severity classes using a linear classification head: $z = W_f f_{mm} + b_f$.
+This feature vector is passed through a regularizing dropout layer ($p=0.3$) and mapped to the $k=8$ disaster identification categories using a linear classification head: $z = W_f f_{mm} + b_f$.
 
 \subsection{Targeted Adversarial Training (FGM)}
 Standard adversarial training techniques like the Fast Gradient Method (FGM) \cite{fgm} globally perturb all trainable parameters. In a highly-augmented multimodal setting, globally applying FGM often destroys the visual spatial coherence established by the Swin-Tiny backbone. Therefore, we introduce a targeted adversarial block. We strictly calculate the adversarial noise $r_{adv}$ over the text encoder's \texttt{word\_embeddings}:
@@ -200,7 +200,7 @@ Finally, the standard Cross-Entropy loss naturally biases predictions toward the
 The architecture was benchmarked in two distinct phases targeting regional low-resource settings and global generalization.
 
 \subsection{Phase 1: BanglaCalamityMMD (Low-Resource)}
-We conducted a rigorous ablation study on the local BanglaCalamityMMD dataset to isolate the performance gains yielded by each architectural component. As presented in Table \ref{table1}, the base multimodal fusion architecture (Run A) struggles severely with noise, yielding a Macro F1 of 0.692. The integration of Targeted FGM (Run B) dramatically smooths the embedding space, jumping the F1-score to 0.724. Finally, incorporating DIPS pseudo-labeling and the Level-2 Optuna stacker (Run C) successfully realigns the class biases, establishing a state-of-the-art threshold of 0.745.
+We conducted a rigorous ablation study on the local BanglaCalamityMMD dataset to isolate the performance gains yielded by each architectural component. The dataset comprises 7,903 multimodal instances in Bangla, cleanly partitioned into 6,323 training, 790 validation, and 790 testing samples across 8 distinct identification categories (Earthquake, Flood, Landslides, Wildfires, Tropical Storms, Droughts, Human Damage, and Non-Disaster). As presented in Table \ref{table1}, the base multimodal fusion architecture (Run A) struggles severely with noise, yielding a Macro F1 of 0.692. The integration of Targeted FGM (Run B) dramatically smooths the embedding space, jumping the F1-score to 0.724. Finally, incorporating DIPS pseudo-labeling and the Level-2 Optuna stacker (Run C) successfully realigns the class biases, establishing a state-of-the-art threshold of 0.745.
 
 % -----------------------------
 % Table 1
@@ -225,7 +225,7 @@ Run C: Full (FGM + DIPS + Stacking) & \textbf{0.745} & \textbf{0.812} \\
 \end{table}
 
 \subsection{Phase 2: CrisisMMD v2.0 (High-Resource)}
-A true disaster-response framework must perform reliably across geographic and linguistic borders. We subjected the exact architecture (substituting the text backbone for the multilingual XLM-RoBERTa-Large) to the CrisisMMD v2.0 benchmark targeting the complex `Damage Severity' task. 
+A true disaster-response framework must perform reliably across geographic and linguistic borders. We subjected the exact architecture (substituting the text backbone for the multilingual XLM-RoBERTa-Large) to the CrisisMMD v2.0 benchmark targeting the complex `Disaster Categorization' task. 
 
 % -----------------------------
 % Table 2

@@ -201,12 +201,15 @@ def run_ablation():
     valid_df = pd.read_csv(CFG.valid_csv)
     test_df = pd.read_csv(CFG.test_csv)
     
-    # Label encoding
-    le = LabelEncoder()
-    train_df['label'] = le.fit_transform(train_df['category'])
-    valid_df['label'] = le.transform(valid_df['category'])
-    test_df['label'] = le.transform(test_df['category'])
-    num_classes = len(le.classes_)
+    # Explicit 8-class Label Mapping for BanglaCalamityMMD
+    label_map = {
+        "Non-Disaster": 0, "Earthquake": 1, "Flood": 2, "Landslides": 3, 
+        "Wildfires": 4, "Tropical Storms": 5, "Droughts": 6, "Human Damage": 7
+    }
+    train_df['label'] = train_df['category'].map(label_map)
+    valid_df['label'] = valid_df['category'].map(label_map)
+    test_df['label'] = test_df['category'].map(label_map)
+    num_classes = len(label_map)
     
     # Mappings
     train_ext_map = get_ext_map(os.path.join(CFG.base_path, "Train"))
