@@ -247,12 +247,17 @@ def run_ablation():
     best_f1_A = 0
     for epoch in range(CFG.epochs):
         train_epoch(model_A, train_loader, optimizer, scaler, scheduler, use_fgm=False)
-        preds, trues, _, _ = valid_epoch(model_A, test_loader)
+        preds, trues, _, _ = valid_epoch(model_A, valid_loader)
         f1 = f1_score(trues, preds, average='macro')
         acc = accuracy_score(trues, preds)
-        print(f"Run A - Epoch {epoch+1}: Macro F1={f1:.4f}, Acc={acc:.4f}")
+        print(f"Run A - Epoch {epoch+1} (Val): Macro F1={f1:.4f}, Acc={acc:.4f}")
         if f1 > best_f1_A:
             best_f1_A = f1
+            
+    print("Evaluating Ablation A on Test Set...")
+    test_preds, test_trues, _, _ = valid_epoch(model_A, test_loader)
+    test_f1_A = f1_score(test_trues, test_preds, average='macro')
+    print(f"Run A Test: Macro F1={test_f1_A:.4f}")
             
     print(f"Best Run A: F1={best_f1_A:.4f}")
 
@@ -268,14 +273,17 @@ def run_ablation():
     best_f1_B = 0
     for epoch in range(CFG.epochs):
         train_epoch(model_B, train_loader, optimizer, scaler, scheduler, fgm=fgm, use_fgm=True)
-        preds, trues, _, _ = valid_epoch(model_B, test_loader)
+        preds, trues, _, _ = valid_epoch(model_B, valid_loader)
         f1 = f1_score(trues, preds, average='macro')
         acc = accuracy_score(trues, preds)
-        print(f"Run B - Epoch {epoch+1}: Macro F1={f1:.4f}, Acc={acc:.4f}")
+        print(f"Run B - Epoch {epoch+1} (Val): Macro F1={f1:.4f}, Acc={acc:.4f}")
         if f1 > best_f1_B:
             best_f1_B = f1
 
-    print(f"Best Run B: F1={best_f1_B:.4f}")
+    print("Evaluating Ablation B on Test Set...")
+    test_preds, test_trues, _, _ = valid_epoch(model_B, test_loader)
+    test_f1_B = f1_score(test_trues, test_preds, average='macro')
+    print(f"Run B Test: Macro F1={test_f1_B:.4f}")
 
     print("Running Ablation C: Base + FGM + DIPS + Stacking")
     # To be concise, we emulate DIPS by tracking test predictions, filtering high conf, appending to train, and training 1 more epoch.
@@ -327,7 +335,8 @@ def run_ablation():
     # Save Results
     results = pd.DataFrame({
         "Run": ["Base", "Base+FGM", "Base+FGM+DIPS+Stack"],
-        "Macro_F1": [best_f1_A, best_f1_B, f1_C]
+        "Val_Macro_F1": [best_f1_A, best_f1_B, study.best_value],
+        "Test_Macro_F1": [test_f1_A, test_f1_B, f1_C]
     })
     results.to_csv("phase1_results.csv", index=False)
     print("Results saved to phase1_results.csv")
