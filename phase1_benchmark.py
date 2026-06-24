@@ -238,6 +238,8 @@ def run_ablation():
     
     print("Running Ablation A: Base")
     model_A = MultimodalModel(num_classes).to(device)
+    if torch.cuda.device_count() > 1:
+        model_A = nn.DataParallel(model_A)
     optimizer = torch.optim.AdamW(model_A.parameters(), lr=CFG.lr, weight_decay=CFG.weight_decay)
     scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CFG.epochs*len(train_loader))
@@ -256,6 +258,8 @@ def run_ablation():
 
     print("Running Ablation B: Base + FGM")
     model_B = MultimodalModel(num_classes).to(device)
+    if torch.cuda.device_count() > 1:
+        model_B = nn.DataParallel(model_B)
     optimizer = torch.optim.AdamW(model_B.parameters(), lr=CFG.lr, weight_decay=CFG.weight_decay)
     scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CFG.epochs*len(train_loader))
