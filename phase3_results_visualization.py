@@ -5,7 +5,7 @@ import os
 
 def visualize_benchmarks():
     print("="*50)
-    print("🔥 DATASET BENCHMARKING RESULTS 🔥")
+    print("DATASET BENCHMARKING RESULTS")
     print("="*50)
     
     # 1. Load Phase 1 Results
@@ -30,7 +30,7 @@ def visualize_benchmarks():
         plt.tight_layout()
         plt.show()
     else:
-        print("\n⚠️ phase1_results.csv not found! Make sure Phase 1 finished running.")
+        print("\n[Warning] phase1_results.csv not found. Make sure Phase 1 finished running.")
 
     # 2. Load Phase 2 Results
     if os.path.exists("phase2_results.csv"):
@@ -52,7 +52,7 @@ def visualize_benchmarks():
         plt.tight_layout()
         plt.show()
     else:
-        print("\n⚠️ phase2_results.csv not found! Make sure Phase 2 finished running.")
+        print("\n[Warning] phase2_results.csv not found. Make sure Phase 2 finished running.")
 
 if __name__ == "__main__":
     visualize_benchmarks()
