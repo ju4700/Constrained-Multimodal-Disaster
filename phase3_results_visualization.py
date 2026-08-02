@@ -28,7 +28,7 @@ def visualize_benchmarks():
                      color='black', ha="center", fontweight='bold')
             
         plt.tight_layout()
-        plt.show()
+        plt.savefig('phase1_ablation.png', dpi=300)
     else:
         print("\n[Warning] phase1_results.csv not found. Make sure Phase 1 finished running.")
 
