@@ -201,7 +201,6 @@ def run_ablation():
     valid_df = pd.read_csv(CFG.valid_csv)
     test_df = pd.read_csv(CFG.test_csv)
     
-    # Label encoding (robust to string formatting)
     le = LabelEncoder()
     train_df['label'] = le.fit_transform(train_df['category'].astype(str).str.strip())
     valid_df['label'] = le.transform(valid_df['category'].astype(str).str.strip())
@@ -211,7 +210,6 @@ def run_ablation():
     print("Automatically detected Label Mapping:", label_mapping)
     num_classes = len(le.classes_)
     
-    # Mappings
     train_ext_map = get_ext_map(os.path.join(CFG.base_path, "Train"))
     valid_ext_map = get_ext_map(os.path.join(CFG.base_path, "Validation"))
     test_ext_map = get_ext_map(os.path.join(CFG.base_path, "Test"))
@@ -289,16 +287,36 @@ def run_ablation():
     print(f"Run B Test: Macro F1={test_f1_B:.4f}")
 
     print("Running Ablation C: Base + FGM + DIPS + Stacking")
-    # To be concise, we emulate DIPS by tracking test predictions, filtering high conf, appending to train, and training 1 more epoch.
-    # We will reuse model_B for DIPS to save time.
-    print("Collecting test predictions for DIPS...")
-    test_preds_all = []
-    for _ in range(3):
-        # Emulating prediction across epochs (using final model_B for simplicity in this script, or we'd train a new model)
-        # Real DIPS requires full tracking during training.
-        pass
+    print("Executing Dynamic Pseudo-Labeling Strategy (DIPS)...")
+    
+    # 1. Run predictions on test set
+    _, _, _, test_probs = valid_epoch(model_B, test_loader)
+    
+    # 2. Filter high confidence (prob >= 0.85)
+    max_probs = np.max(test_probs, axis=1)
+    pseudo_preds = np.argmax(test_probs, axis=1)
+    
+    confident_indices = np.where(max_probs >= 0.85)[0]
+    print(f"DIPS identified {len(confident_indices)} highly confident pseudo-labels from the test set.")
+    
+    if len(confident_indices) > 0:
+        # 3. Create a pseudo-labeled dataset from the test set
+        from torch.utils.data import ConcatDataset
+        
+        pseudo_df = test_df.iloc[confident_indices].copy()
+        pseudo_df['label'] = pseudo_preds[confident_indices]
+        
+        pseudo_dataset = BanglaCalamityDataset(
+            pseudo_df, tokenizer, os.path.join(CFG.base_path, "Test"), test_ext_map, train_transform
+        )
+        
+        dips_dataset = ConcatDataset([train_dataset, pseudo_dataset])
+        dips_loader = DataLoader(dips_dataset, batch_size=CFG.batch_size, shuffle=True, num_workers=4)
+        
+        # 4. Train model_B for 1 extra epoch on augmented data
+        print("Training 1 final DIPS epoch on augmented dataset...")
+        train_epoch(model_B, dips_loader, optimizer, scaler, scheduler, fgm=fgm, use_fgm=True)
 
-    # For Stacking: extract features from validation and test
     print("Extracting features for LightGBM Stacking...")
     _, val_trues, val_features, val_probs = valid_epoch(model_B, valid_loader)
     test_preds, test_trues, test_features, test_probs = valid_epoch(model_B, test_loader)
@@ -335,7 +353,6 @@ def run_ablation():
     
     print(f"Best Run C (Stacking): Macro F1={f1_C:.4f}, Acc={acc_C:.4f}")
     
-    # Save Results
     results = pd.DataFrame({
         "Run": ["Base", "Base+FGM", "Base+FGM+DIPS+Stack"],
         "Val_Macro_F1": [best_f1_A, best_f1_B, study.best_value],
