@@ -114,6 +114,7 @@ class BanglaCalamityDataset(Dataset):
         }
 
 class MultimodalModel(nn.Module):
+    """Run A/B/C: Late-Fusion via simple concatenation of CLS token and pooled image vector."""
     def __init__(self, num_classes):
         super().__init__()
         self.text_model = AutoModel.from_pretrained(CFG.text_model)
@@ -129,6 +130,128 @@ class MultimodalModel(nn.Module):
         features = self.drop(features)
         out = self.fc(features)
         return out, features
+
+
+class CrossAttentionFusion(nn.Module):
+    """
+    Bidirectional Cross-Attention Fusion module.
+
+    - Text tokens attend to image patches  (text queries image)
+    - Image patches attend to text tokens  (image queries text)
+
+    Both streams are then pooled and concatenated before the final classifier.
+    This enables each modality to selectively extract information from the
+    other, which is fundamentally more expressive than simple concatenation.
+    """
+    def __init__(self, text_dim=768, vision_dim=768, fusion_dim=512, num_heads=8, dropout=0.1):
+        super().__init__()
+        # Project both modalities into a common fusion space
+        self.text_proj   = nn.Linear(text_dim,   fusion_dim)
+        self.vision_proj = nn.Linear(vision_dim, fusion_dim)
+
+        # Cross-attention: text queries attend to image patch keys/values
+        self.text_to_img = nn.MultiheadAttention(
+            embed_dim=fusion_dim, num_heads=num_heads,
+            dropout=dropout, batch_first=True
+        )
+        # Cross-attention: image queries attend to text token keys/values
+        self.img_to_text = nn.MultiheadAttention(
+            embed_dim=fusion_dim, num_heads=num_heads,
+            dropout=dropout, batch_first=True
+        )
+
+        # Post-attention layer norms (pre-norm residual style)
+        self.norm_t = nn.LayerNorm(fusion_dim)
+        self.norm_v = nn.LayerNorm(fusion_dim)
+
+        # Feed-forward to produce final fused representation
+        self.ffn = nn.Sequential(
+            nn.Linear(fusion_dim * 2, fusion_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(fusion_dim, fusion_dim),
+        )
+        self.norm_out = nn.LayerNorm(fusion_dim)
+
+    def forward(self, text_seq, img_patches):
+        """
+        Args:
+            text_seq:    (B, seq_len,     text_dim)   — full BanglaBERT hidden states
+            img_patches: (B, num_patches, vision_dim) — Swin patch token sequence
+        Returns:
+            fused: (B, fusion_dim)
+        """
+        t = self.text_proj(text_seq)      # (B, seq_len,     fusion_dim)
+        v = self.vision_proj(img_patches) # (B, num_patches, fusion_dim)
+
+        # Text → Image cross-attention (with residual)
+        t_att, _ = self.text_to_img(query=t, key=v, value=v)
+        t_att = self.norm_t(t + t_att)   # (B, seq_len, fusion_dim)
+
+        # Image → Text cross-attention (with residual)
+        v_att, _ = self.img_to_text(query=v, key=t, value=t)
+        v_att = self.norm_v(v + v_att)   # (B, num_patches, fusion_dim)
+
+        # Pool: CLS token for text, mean pool over patches for image
+        t_cls  = t_att[:, 0, :]      # (B, fusion_dim)
+        v_mean = v_att.mean(dim=1)   # (B, fusion_dim)
+
+        # Concatenate and pass through feed-forward head
+        fused = torch.cat([t_cls, v_mean], dim=1)  # (B, fusion_dim * 2)
+        fused = self.norm_out(self.ffn(fused))     # (B, fusion_dim)
+        return fused
+
+
+class CrossAttentionMultimodalModel(nn.Module):
+    """
+    Run D: Cross-Attention Transformer Fusion.
+
+    Instead of blindly concatenating pooled features, the cross-attention
+    module allows text tokens to selectively attend to image patches that
+    are semantically relevant, and vice versa. This is the mechanism used
+    in modern vision-language models (ALBEF, FLAVA, ViLBERT).
+    """
+    def __init__(self, num_classes, fusion_dim=512, num_heads=8):
+        super().__init__()
+        # Text encoder: output full sequence of hidden states
+        self.text_model = AutoModel.from_pretrained(CFG.text_model)
+        text_dim = self.text_model.config.hidden_size  # 768 for BanglaBERT
+
+        # Vision encoder: disable global pooling to get patch token sequence
+        self.vision_model = timm.create_model(
+            CFG.vision_model, pretrained=True, num_classes=0, global_pool=''
+        )
+        vision_dim = self.vision_model.num_features  # 768 for Swin-Tiny
+
+        # Bidirectional cross-attention fusion
+        self.fusion = CrossAttentionFusion(
+            text_dim=text_dim,
+            vision_dim=vision_dim,
+            fusion_dim=fusion_dim,
+            num_heads=num_heads,
+        )
+
+        self.drop = nn.Dropout(0.3)
+        self.fc   = nn.Linear(fusion_dim, num_classes)
+
+    def forward(self, input_ids, attention_mask, pixel_values):
+        # Full token sequence from text encoder
+        text_out = self.text_model(input_ids=input_ids, attention_mask=attention_mask)
+        text_seq = text_out.last_hidden_state  # (B, seq_len, 768)
+
+        # Patch token sequence from vision encoder (global_pool='' keeps spatial dims)
+        vision_out = self.vision_model(pixel_values)  # (B, H, W, C) or (B, HW, C)
+        if vision_out.dim() == 4:
+            B, H, W, C = vision_out.shape
+            img_patches = vision_out.reshape(B, H * W, C)  # → (B, num_patches, C)
+        else:
+            img_patches = vision_out  # Already (B, num_patches, C)
+
+        # Cross-attention fusion
+        fused  = self.fusion(text_seq, img_patches)  # (B, fusion_dim)
+        fused  = self.drop(fused)
+        logits = self.fc(fused)
+        return logits, fused
 
 def get_ext_map(folder):
     if not os.path.exists(folder): return {}
@@ -352,14 +475,58 @@ def run_ablation():
     acc_C = accuracy_score(test_trues, lgb_test_labels)
     
     print(f"Best Run C (Stacking): Macro F1={f1_C:.4f}, Acc={acc_C:.4f}")
-    
+
+    # ──────────────────────────────────────────
+    # RUN D: Cross-Attention Transformer Fusion
+    # ──────────────────────────────────────────
+    print("\nRunning Ablation D: Cross-Attention Transformer Fusion")
+    model_D = CrossAttentionMultimodalModel(num_classes).to(device)
+    if torch.cuda.device_count() > 1:
+        model_D = nn.DataParallel(model_D)
+    optimizer = torch.optim.AdamW(model_D.parameters(), lr=CFG.lr, weight_decay=CFG.weight_decay)
+    scaler    = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CFG.epochs * len(train_loader))
+    fgm_D     = FGM(model_D, epsilon=CFG.fgm_epsilon)
+
+    best_f1_D = 0.0
+    for epoch in range(CFG.epochs):
+        train_epoch(model_D, train_loader, optimizer, scaler, scheduler, fgm=fgm_D, use_fgm=True)
+        preds, trues, _, _ = valid_epoch(model_D, valid_loader)
+        f1  = f1_score(trues, preds, average='macro')
+        acc = accuracy_score(trues, preds)
+        print(f"Run D - Epoch {epoch+1} (Val): Macro F1={f1:.4f}, Acc={acc:.4f}")
+        if f1 > best_f1_D:
+            best_f1_D = f1
+
+    print("Evaluating Ablation D on Test Set...")
+    test_preds_D, test_trues_D, _, _ = valid_epoch(model_D, test_loader)
+    test_f1_D  = f1_score(test_trues_D, test_preds_D, average='macro')
+    test_acc_D = accuracy_score(test_trues_D, test_preds_D)
+    print(f"Run D Test: Macro F1={test_f1_D:.4f}, Acc={test_acc_D:.4f}")
+
+    # ──────────────────────────────────────────
+    # SAVE ALL RESULTS
+    # ──────────────────────────────────────────
     results = pd.DataFrame({
-        "Run": ["Base", "Base+FGM", "Base+FGM+DIPS+Stack"],
-        "Val_Macro_F1": [best_f1_A, best_f1_B, study.best_value],
-        "Test_Macro_F1": [test_f1_A, test_f1_B, f1_C]
+        "Run": [
+            "A: Base (Concat Fusion)",
+            "B: Base + FGM",
+            "C: FGM + DIPS + LightGBM Stack",
+            "D: Cross-Attention Fusion + FGM"
+        ],
+        "Val_Macro_F1":  [best_f1_A,      best_f1_B,      study.best_value, best_f1_D],
+        "Test_Macro_F1": [test_f1_A,      test_f1_B,      f1_C,             test_f1_D],
+        "Test_Accuracy": [
+            accuracy_score(test_trues, test_preds),
+            accuracy_score(test_trues, test_preds),
+            acc_C,
+            test_acc_D
+        ]
     })
     results.to_csv("phase1_results.csv", index=False)
-    print("Results saved to phase1_results.csv")
+    print("\n=== FINAL ABLATION RESULTS ===")
+    print(results.to_string(index=False))
+    print("\nResults saved to phase1_results.csv")
 
 if __name__ == "__main__":
     run_ablation()
